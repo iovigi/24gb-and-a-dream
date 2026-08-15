@@ -1,0 +1,43 @@
+app:
+  projects_dir: "./projects"
+  mock_mode: false
+  max_scene_retries: 2
+  min_free_disk_gb: 2.0
+gpu:
+  auto_unload: true
+  preferred_device: "cuda"
+llm:
+  backend: "llama_cpp_cli"
+  model_path: "./models/llm/Qwen3-8B-Q5_K_M.gguf"
+  executable: "./runtime/llama.cpp/llama-cli.exe"
+  context_size: 8192
+  predict_tokens: 2048
+  gpu_layers: -1
+comfyui:
+  host: "127.0.0.1"
+  port: 8188
+  workflows_dir: "./workflows"
+  timeout_seconds: 3600
+video:
+  backend: "wan22"
+  default_width: 1280
+  default_height: 704
+  default_fps: 24
+  default_steps: 20
+  default_cfg: 5.0
+  clip_seconds: 5.0
+tts:
+  default_language: "bg"
+  bg:
+    backend: "local"
+    model_path: "./models/tts"
+    command: ["./runtime/tts/.venv/Scripts/python.exe", "./tts/piper_runner.py", "--models-dir", "{model_path}", "--language", "{language}", "--voice", "{voice}", "--speed", "{speed}", "--text", "{text}", "--output", "{output}"]
+  en:
+    backend: "local"
+    model_path: "./models/tts"
+    command: ["./runtime/tts/.venv/Scripts/python.exe", "./tts/piper_runner.py", "--models-dir", "{model_path}", "--language", "{language}", "--voice", "{voice}", "--speed", "{speed}", "--text", "{text}", "--output", "{output}"]
+ffmpeg:
+  binary: "./runtime/ffmpeg/ffmpeg.exe"
+  ffprobe_binary: "./runtime/ffmpeg/ffprobe.exe"
+  encoder: "h264_nvenc"
+  fallback_encoder: "libx264"

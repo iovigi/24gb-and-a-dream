@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.3,<9
+pytest-cov>=6,<7
+pyinstaller>=6.11,<7
