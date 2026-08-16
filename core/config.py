@@ -37,6 +37,15 @@ class ComfyUIConfig(StrictModel):
     port: int = Field(default=8188, ge=1, le=65535)
     workflows_dir: Path = Path("./workflows")
     timeout_seconds: int = Field(default=3600, ge=1)
+    # Start ComfyUI from the app itself, so the packaged executable does not
+    # depend on run.ps1 having launched it first.
+    autostart: bool = True
+    python: Path = Path("./runtime/ComfyUI/.venv/Scripts/python.exe")
+    root: Path = Path("./runtime/ComfyUI")
+    startup_timeout_seconds: int = Field(default=180, ge=1)
+    # Only ever applies to an instance this app started; one that was already
+    # running belongs to whoever started it.
+    stop_on_exit: bool = True
 
     @property
     def http_url(self) -> str:
@@ -95,6 +104,8 @@ class Settings(StrictModel):
         self.llm.model_path = resolved(self.llm.model_path)
         self.llm.executable = resolved(self.llm.executable)
         self.comfyui.workflows_dir = resolved(self.comfyui.workflows_dir)
+        self.comfyui.python = resolved(self.comfyui.python)
+        self.comfyui.root = resolved(self.comfyui.root)
         self.tts.bg.model_path = resolved(self.tts.bg.model_path)
         self.tts.en.model_path = resolved(self.tts.en.model_path)
         return self

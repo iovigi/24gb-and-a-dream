@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.config import Settings
 from core.events import NullObserver, PipelineObserver
+from core.preflight import check as preflight_check
 from core.project import VideoProject
 from core.requests import GenerationRequest
 from llm.factory import LLMFactory
@@ -13,8 +14,9 @@ from render.factory import VideoRendererFactory
 from render.subtitles import write_srt
 from render.timeline import audio_duration, build_timeline
 from tts.factory import TTSEngineFactory
+from utils.crash import note_activity
 from utils.gpu import release_gpu_memory
-from utils.logging import configure_logging
+from utils.logging import attach_project_log, detach_project_log
 from utils.paths import ensure_free_disk_space, resolution_for_aspect_ratio
 from video.base import VideoGenerationRequest
 from video.factory import VideoGeneratorFactory
@@ -42,10 +44,15 @@ class GenerationPipeline:
 
     def run(self, request: GenerationRequest, project: VideoProject | None = None) -> Path:
         self.cancel_event.clear()
+        # Fail before a project folder is created, and report every missing
+        # piece at once instead of one per attempt.
+        note_activity("preflight checks")
+        preflight_check(self.settings, request)
         ensure_free_disk_space(self.settings.app.projects_dir, self.settings.app.min_free_disk_gb)
         project = project or VideoProject.create(request, self.settings.app.projects_dir)
-        self.logger = configure_logging(project.project_directory)
+        self.logger = attach_project_log(project.project_directory)
         self.logger.info("Generation started project=%s mode=%s", project.id, request.video_mode)
+        note_activity(f"pipeline start project={project.id}")
         try:
             if project.director_plan is None:
                 self._plan(project, request)
@@ -86,6 +93,8 @@ class GenerationPipeline:
             self._video = None
             self._renderer = None
             release_gpu_memory()
+            note_activity("pipeline finished")
+            detach_project_log()
 
     def _plan(self, project: VideoProject, request: GenerationRequest) -> None:
         project.status = "planning"
@@ -93,7 +102,9 @@ class GenerationPipeline:
         self.observer.status_changed("Analyzing prompt...")
         self.observer.progress_changed(5)
         engine = LLMFactory.create(self.settings.llm)
+        self.logger.info("LLM backend=%s model=%s", self.settings.llm.backend, self.settings.llm.model_path)
         try:
+            note_activity(f"LLM planning ({self.settings.llm.backend})")
             plan = engine.create_director_plan(request)
             if request.narration_mode == "manual" and request.voice_enabled:
                 actual = "".join(scene.narrator.text for scene in plan.scenes)
@@ -122,6 +133,7 @@ class GenerationPipeline:
                     continue
                 path = project.project_directory / "audio" / f"scene_{scene.id:03d}.wav"
                 if not path.is_file() or path.stat().st_size == 0:
+                    note_activity(f"TTS scene {scene.id}")
                     engine.synthesize(scene.narrator.text, path, request.voice_name, request.tts_speed)
                 paths.append(path)
                 durations[scene.id] = audio_duration(path)
@@ -132,9 +144,21 @@ class GenerationPipeline:
             engine.unload()
             release_gpu_memory(engine)
 
+    def _ensure_comfyui(self) -> None:
+        if self.settings.video.backend == "mock":
+            return
+        from video.comfy_launcher import shared_launcher
+
+        self.observer.status_changed("Checking ComfyUI...")
+        note_activity("starting ComfyUI")
+        launcher = shared_launcher(self.settings.comfyui)
+        if launcher.ensure_running(progress=self.observer.status_changed):
+            self.logger.info("ComfyUI was started by the application")
+
     def _generate_scenes(self, project: VideoProject, request: GenerationRequest, timings) -> list[Path]:
         project.status = "generating"
         project.save()
+        self._ensure_comfyui()
         self._video = VideoGeneratorFactory.create(self.settings)
         width, height = resolution_for_aspect_ratio(
             request.aspect_ratio, self.settings.video.default_width, self.settings.video.default_height,
@@ -171,6 +195,10 @@ class GenerationPipeline:
                     )
                     for attempt in range(self.settings.app.max_scene_retries + 1):
                         try:
+                            note_activity(
+                                f"video scene {scene.id} chunk {chunk_index}/{timing.clip_count} "
+                                f"attempt {attempt + 1}"
+                            )
                             if project.reference_image:
                                 self._video.image_to_video(video_request)
                             else:
@@ -201,6 +229,7 @@ class GenerationPipeline:
         self.observer.progress_changed(90)
         self._renderer = VideoRendererFactory.create(self.settings)
         output = project.project_directory / "output" / "final.mp4"
+        note_activity(f"ffmpeg render -> {output}")
         return self._renderer.render(scene_paths, audio_paths, output)
 
     def _check_cancelled(self) -> None:

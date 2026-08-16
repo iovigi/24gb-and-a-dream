@@ -45,6 +45,7 @@ class ComfyUIClient:
         return str(Path(data.get("subfolder", "")) / data["name"]).replace("\\", "/")
 
     def submit_workflow(self, workflow: dict[str, Any]) -> str:
+        response = None
         try:
             response = self.session.post(
                 f"{self.config.http_url}/prompt",
@@ -53,9 +54,13 @@ class ComfyUIClient:
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
-            raise ComfyUIError("Could not submit workflow to ComfyUI") from exc
+            # A rejected workflow comes back as HTTP 400 with the reason in the
+            # body; without it the caller only learns that something failed.
+            raise ComfyUIError(
+                f"Could not submit workflow to ComfyUI: {_response_detail(response, exc)}"
+            ) from exc
         if data.get("node_errors"):
-            raise ComfyUIError(f"ComfyUI rejected workflow: {data['node_errors']}")
+            raise ComfyUIError(f"ComfyUI rejected workflow: {_describe_errors(data['node_errors'])}")
         return str(data["prompt_id"])
 
     def wait_for_completion(self, prompt_id: str, cancel_event: threading.Event | None = None) -> dict[str, Any]:
@@ -106,3 +111,39 @@ class ComfyUIClient:
             self.session.post(f"{self.config.http_url}/interrupt", timeout=5)
         except requests.RequestException:
             pass
+
+
+def _response_detail(response: Any, exc: Exception) -> str:
+    """The reason ComfyUI gave, rather than just the transport failure."""
+    if response is None:
+        return str(exc)
+    detail = f"HTTP {response.status_code}"
+    try:
+        body = response.json()
+    except ValueError:
+        text = (response.text or "").strip()
+        return f"{detail}: {text[:500]}" if text else detail
+    if isinstance(body, dict):
+        parts = [str(body[key]) for key in ("error", "message") if body.get(key)]
+        if body.get("node_errors"):
+            parts.append(_describe_errors(body["node_errors"]))
+        if parts:
+            return f"{detail}: {' | '.join(parts)}"
+    return f"{detail}: {body}"
+
+
+def _describe_errors(node_errors: Any) -> str:
+    """Flatten ComfyUI's per-node error structure into one readable line."""
+    if not isinstance(node_errors, dict):
+        return str(node_errors)
+    described: list[str] = []
+    for node_id, details in node_errors.items():
+        if not isinstance(details, dict):
+            described.append(f"node {node_id}: {details}")
+            continue
+        node_type = details.get("class_type", "?")
+        for error in details.get("errors", []) or [{}]:
+            message = error.get("message", details.get("message", "unknown error"))
+            extra = error.get("details", "")
+            described.append(f"node {node_id} ({node_type}): {message}{f' - {extra}' if extra else ''}")
+    return "; ".join(described)

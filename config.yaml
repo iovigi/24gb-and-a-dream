@@ -18,6 +18,11 @@ comfyui:
   port: 8188
   workflows_dir: "./workflows"
   timeout_seconds: 3600
+  autostart: true
+  python: "./runtime/ComfyUI/.venv/Scripts/python.exe"
+  root: "./runtime/ComfyUI"
+  startup_timeout_seconds: 180
+  stop_on_exit: true
 video:
   backend: "wan22"
   default_width: 1280

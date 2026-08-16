@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from core.config import FFmpegConfig
+
+_logger = logging.getLogger("dream24gb.ffmpeg")
 
 
 class VideoRenderer(ABC):
@@ -73,6 +76,7 @@ class FFmpegVideoRenderer(VideoRenderer):
         return output_path
 
     def _run(self, command: list[str]) -> None:
+        _logger.info("ffmpeg: %s", " ".join(command))
         try:
             with self._lock:
                 self._process = subprocess.Popen(
@@ -81,9 +85,15 @@ class FFmpegVideoRenderer(VideoRenderer):
                 )
             _, stderr = self._process.communicate()
             if self._process.returncode:
+                _logger.error(
+                    "ffmpeg exit code %s\ncommand: %s\n%s",
+                    self._process.returncode, " ".join(command), stderr,
+                )
                 tail = "\n".join(stderr.splitlines()[-20:])
                 raise RuntimeError(f"FFmpeg failed with exit code {self._process.returncode}:\n{tail}")
+            _logger.debug("ffmpeg finished ok")
         except FileNotFoundError as exc:
+            _logger.error("ffmpeg binary missing: %s", self.config.binary)
             raise RuntimeError(f"FFmpeg was not found: {self.config.binary}") from exc
         finally:
             with self._lock:

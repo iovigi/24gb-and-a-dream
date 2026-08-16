@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import subprocess
@@ -13,6 +14,16 @@ from llm.base import LLMEngine
 from llm.parser import parse_director_response
 from llm.prompts import build_director_prompt, build_repair_prompt
 from llm.schemas import ProjectPlan
+from utils.logging import get_logger, log_directory
+
+_logger = get_logger("llama")
+
+
+def _log_tail(path, lines: int = 25) -> str:
+    try:
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "(no output captured)"
 
 
 def _free_local_port() -> int:
@@ -43,9 +54,16 @@ class QwenLlamaCliEngine(LLMEngine):
             "-c", str(self.config.context_size), "-ngl", gpu_layers,
             "--host", "127.0.0.1", "--port", str(port), "--parallel", "1",
         ]
+        # llama-server output goes to its own log: when it dies during model load
+        # the reason (VRAM, bad GGUF, missing DLL) is only visible there.
+        server_log_path = log_directory() / "llama-server.log"
+        _logger.info("Starting llama-server: %s", " ".join(command))
+        _logger.info("llama-server log: %s", server_log_path)
+        server_log = open(server_log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        server_log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} | {' '.join(command)} =====\n")
         process = subprocess.Popen(
-            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            command, stdin=subprocess.DEVNULL, stdout=server_log,
+            stderr=subprocess.STDOUT,
             creationflags=(
                 getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -56,7 +74,14 @@ class QwenLlamaCliEngine(LLMEngine):
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError(f"llama-server exited during startup with code {process.returncode}")
+                    tail = _log_tail(server_log_path)
+                    _logger.error(
+                        "llama-server exited during startup code=%s\n%s", process.returncode, tail,
+                    )
+                    raise RuntimeError(
+                        f"llama-server exited during startup with code {process.returncode}.\n"
+                        f"Last output:\n{tail}"
+                    )
                 try:
                     if requests.get(f"{base_url}/health", timeout=1).status_code == 200:
                         break
@@ -114,6 +139,12 @@ class QwenLlamaCliEngine(LLMEngine):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+            elif process.returncode:
+                _logger.warning(
+                    "llama-server had already exited with code %s\n%s",
+                    process.returncode, _log_tail(server_log_path),
+                )
+            server_log.close()
 
     def create_director_plan(self, request: GenerationRequest) -> ProjectPlan:
         raw = self._complete(build_director_prompt(request))

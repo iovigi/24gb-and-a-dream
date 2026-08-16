@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from pydantic import ValidationError
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QCoreApplication, QThread, Qt, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -15,16 +16,49 @@ from PySide6.QtWidgets import (
 
 from core.config import Settings
 from core.pipeline import GenerationPipeline
+from core.preflight import missing_requirements
 from core.requests import GenerationRequest
 from ui.widgets.image_picker import ImagePicker
 from ui.worker import GenerationWorker
+from utils.crash import note_activity
 from utils.gpu import gpu_summary
+from utils.logging import log_directory
+
+
+_logger = logging.getLogger("dream24gb.ui")
+
+
+def _on_gui_thread(context: str) -> bool:
+    """Refuse to touch widgets from a worker thread.
+
+    Qt widget access outside the GUI thread is undefined behaviour: it corrupts
+    Qt's internal state and the process dies later with an access violation,
+    far away from the real cause. Logging and skipping keeps the app alive and
+    names the offender.
+    """
+    application = QCoreApplication.instance()
+    if application is None or QThread.currentThread() == application.thread():
+        return True
+    _logger.critical(
+        "BLOCKED cross-thread GUI access in %s (current thread: %s). "
+        "This would have crashed the process; the update was skipped.",
+        context, QThread.currentThread(),
+    )
+    return False
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        log_path: Path | None = None,
+        crash_log_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self.settings = settings
+        self.log_path = log_path or (log_directory() / "app.log")
+        self.crash_log_path = crash_log_path or (log_directory() / "crash.log")
+        self.logger = logging.getLogger("dream24gb.ui")
         self.thread: QThread | None = None
         self.worker: GenerationWorker | None = None
         self.output_path: Path | None = None
@@ -32,6 +66,32 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("24GB and a Dream")
         self.resize(1040, 820)
         self._build_ui()
+        self._report_missing_requirements()
+        self.logger.info("Main window ready")
+
+    def _report_missing_requirements(self) -> None:
+        """Say up front what is missing, rather than minutes into a generation."""
+        problems = missing_requirements(self.settings)
+        if not problems:
+            return
+        for problem in problems:
+            self.logger.warning("Missing requirement: %s", problem)
+        self.status_label.setText(
+            f"{len(problems)} required file(s) missing — generation will fail. See the log."
+        )
+        self.status_label.setToolTip("\n".join(problems))
+
+    def report_previous_crash(self) -> None:
+        """Tell the user the last run died, and point at the evidence."""
+        self.logger.warning("Previous session did not exit cleanly")
+        self.status_label.setText("Last run ended unexpectedly — see the log for details.")
+        QMessageBox.warning(
+            self,
+            "Previous run crashed",
+            "The last session ended without shutting down cleanly.\n\n"
+            f"Crash report: {self.crash_log_path}\n"
+            f"Session log: {self.log_path}",
+        )
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -147,10 +207,16 @@ class MainWindow(QMainWindow):
         self.plan_preview.setReadOnly(True)
         self.plan_preview.setPlaceholderText("The validated scene plan will appear here.")
         layout.addWidget(self.plan_preview, 1)
+        buttons = QHBoxLayout()
         self.open_output_button = QPushButton("Open output folder")
         self.open_output_button.setEnabled(False)
         self.open_output_button.clicked.connect(self.open_output_folder)
-        layout.addWidget(self.open_output_button)
+        self.open_logs_button = QPushButton("Open logs")
+        self.open_logs_button.setToolTip(str(self.log_path))
+        self.open_logs_button.clicked.connect(self.open_logs_folder)
+        buttons.addWidget(self.open_output_button)
+        buttons.addWidget(self.open_logs_button)
+        layout.addLayout(buttons)
         return panel
 
     def _make_request(self) -> GenerationRequest:
@@ -169,8 +235,14 @@ class MainWindow(QMainWindow):
         try:
             request = self._make_request()
         except ValidationError as exc:
+            self.logger.warning("Invalid generation settings: %s", exc)
             QMessageBox.warning(self, "Check generation settings", exc.errors()[0]["msg"])
             return
+        self.logger.info(
+            "Starting generation duration=%ss aspect=%s style=%s voice=%s",
+            request.duration_seconds, request.aspect_ratio, request.style, request.voice_enabled,
+        )
+        note_activity("generation requested")
         self.generate_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.open_output_button.setEnabled(False)
@@ -180,11 +252,17 @@ class MainWindow(QMainWindow):
         self.thread = QThread(self)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.status.connect(self.status_label.setText)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.plan.connect(lambda plan: self.plan_preview.setPlainText(plan.model_dump_json(indent=2)))
-        self.worker.completed.connect(self.generation_completed)
-        self.worker.failed.connect(self.generation_failed)
+        # Every worker signal must reach the GUI thread through the event loop.
+        # A lambda receiver has no thread affinity, so PySide6 runs it in the
+        # worker thread; touching a widget from there corrupts Qt and kills the
+        # process with an access violation. Bound slots plus an explicit queued
+        # connection keep all widget access on the GUI thread.
+        queued = Qt.ConnectionType.QueuedConnection
+        self.worker.status.connect(self.status_label.setText, queued)
+        self.worker.progress.connect(self.progress.setValue, queued)
+        self.worker.plan.connect(self.display_plan, queued)
+        self.worker.completed.connect(self.generation_completed, queued)
+        self.worker.failed.connect(self.generation_failed, queued)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -197,16 +275,38 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.cancel_button.setEnabled(False)
 
+    @Slot(object)
+    def display_plan(self, plan) -> None:
+        if not _on_gui_thread("display_plan"):
+            return
+        self.plan_preview.setPlainText(plan.model_dump_json(indent=2))
+
+    @Slot(str)
     def generation_completed(self, output: str) -> None:
+        if not _on_gui_thread("generation_completed"):
+            return
+        self.logger.info("Generation completed: %s", output)
+        note_activity("generation completed")
         self.output_path = Path(output)
         self.open_output_button.setEnabled(True)
 
+    @Slot(str)
     def generation_failed(self, message: str) -> None:
+        if not _on_gui_thread("generation_failed"):
+            return
+        self.logger.error("Generation stopped: %s", message)
+        note_activity("generation failed")
         self.status_label.setText(message)
         if not message.lower().startswith("generation cancelled"):
-            QMessageBox.critical(self, "Generation stopped", message)
+            QMessageBox.critical(
+                self, "Generation stopped", f"{message}\n\nFull log: {self.log_path}"
+            )
 
+    @Slot()
     def _worker_finished(self) -> None:
+        if not _on_gui_thread("_worker_finished"):
+            return
+        self.logger.info("Worker thread finished")
         self.generate_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.thread = None
@@ -218,7 +318,11 @@ class MainWindow(QMainWindow):
         if self.output_path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_path.parent)))
 
+    def open_logs_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_path.parent)))
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.logger.info("Close requested (generation running=%s)", self.worker is not None)
         if self.worker:
             self.worker.cancel()
             self._close_when_finished = True

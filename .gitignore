@@ -5,8 +5,10 @@ __pycache__/
 dist/
 build/
 runtime/
-*.spec
 models/*
 !models/.gitkeep
 projects/*
 !projects/.gitkeep
+
+# runtime logs
+logs/

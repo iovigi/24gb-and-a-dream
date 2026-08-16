@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from core.config import ComfyUIConfig
+from utils.logging import get_logger
 from video.base import VideoGenerationRequest, VideoGenerator
 from video.comfyui_client import ComfyUIClient, ComfyUIError
+
+_logger = get_logger("wan")
 
 
 class WanVideoGenerator(VideoGenerator):
@@ -26,9 +29,15 @@ class WanVideoGenerator(VideoGenerator):
     def _generate(self, request: VideoGenerationRequest, workflow_name: str) -> Path:
         self.cancel_event.clear()
         workflow = self._load_workflow(workflow_name)
+        seed = request.resolved_seed()
+        _logger.info(
+            "ComfyUI %s seed=%d %dx%d steps=%d cfg=%s -> %s",
+            workflow_name, seed, request.width, request.height,
+            request.steps, request.cfg, request.output_path.name,
+        )
         values: dict[str, Any] = {
             "PROMPT": request.prompt, "NEGATIVE_PROMPT": request.negative_prompt,
-            "SEED": request.seed, "WIDTH": request.width, "HEIGHT": request.height,
+            "SEED": seed, "WIDTH": request.width, "HEIGHT": request.height,
             # Wan video latents require a 4n+1 frame count. Five seconds at 24 fps is 121 frames.
             "FRAMES": max(1, ((round(request.duration_seconds * request.fps) + 3) // 4) * 4 + 1),
             "FPS": request.fps, "STEPS": request.steps, "CFG": request.cfg,
